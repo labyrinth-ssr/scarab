@@ -75,7 +75,7 @@ static inline Flag dcache_stage_addr_unready(Op* op);
 static inline Flag dcache_stage_check_mem_type(Op* op);
 static inline void dcache_stage_remove_src_op(Stage_Data* src_sd, int ii);
 
-static inline void dcache_cacheline_hit(Op* op, Addr line_addr, Dcache_Data* line);
+static inline void dcache_cacheline_hit(Op* op, Addr line_addr, Dcache_Data* line, uns extra_cycles);
 static inline void dcache_cacheline_miss(Op* op, Addr line_addr, Dcache_3C_Type miss_3c_type);
 
 static inline Dcache_3C_Type dcache_3c_process_access(Op* op, Addr line_addr, Flag real_dcache_miss);
@@ -272,8 +272,10 @@ void update_dcache_stage(Stage_Data* src_sd) {
     else
       STAT_EVENT(op->proc_id, POWER_DCACHE_READ_ACCESS);
 
+    Flag victim_cache_hit = FALSE;
     if (VICTIM_CACHE_ON && VICTIM_CACHE_ENTRIES > 0 && !line) {
       line = dcache_victim_cache_access(op, line_addr);
+      victim_cache_hit = line != NULL;
     }
 
     // if the data hits dc_pref_cache then insert to the dcache immediately
@@ -300,7 +302,7 @@ void update_dcache_stage(Stage_Data* src_sd) {
 
     if (line) {
       dcache_3c_process_access(op, line_addr, FALSE);
-      dcache_cacheline_hit(op, line_addr, line);
+      dcache_cacheline_hit(op, line_addr, line, victim_cache_hit ? VICTIM_CACHE_CYCLES : 0);
       continue;
     }
     dcache_cacheline_miss(op, line_addr, DCACHE_3C_NONE);
@@ -652,7 +654,7 @@ static inline Dcache_Data* dcache_victim_cache_access(Op* op, Addr line_addr) {
   return dcache_line;
 }
 
-static inline void dcache_cacheline_hit(Op* op, Addr line_addr, Dcache_Data* line) {
+static inline void dcache_cacheline_hit(Op* op, Addr line_addr, Dcache_Data* line, uns extra_cycles) {
   /* prefetching handle */
   if (PREF_FRAMEWORK_ON && (PREF_UPDATE_ON_WRONGPATH || !op->off_path)) {
     // if framework is on use new prefetcher. otherwise old one
@@ -687,7 +689,7 @@ static inline void dcache_cacheline_hit(Op* op, Addr line_addr, Dcache_Data* lin
   }
 
   /* update cacheline state */
-  op->done_cycle = cycle_count + DCACHE_CYCLES + op->inst_info->extra_ld_latency;
+  op->done_cycle = cycle_count + DCACHE_CYCLES + extra_cycles + op->inst_info->extra_ld_latency;
   line->read_count[op->off_path] = line->read_count[op->off_path] + (op->inst_info->table_info.mem_type == MEM_LD);
   line->write_count[op->off_path] = line->write_count[op->off_path] + (op->inst_info->table_info.mem_type == MEM_ST);
   line->misc_state = (line->misc_state & 2) | op->off_path;
