@@ -85,6 +85,8 @@ static inline void dcache_fill_wp_collect_stats(Dcache_Data* line, Mem_Req* req)
 static inline void dcache_hit_wp_collect_stats(Dcache_Data* line, Op* op);
 static inline Flag dcache_miss_new_mem_req(Op* op, Addr line_addr, Mem_Req_Type mem_req_type);
 static inline void dcache_miss_extra_access(Op* op, Cache* cache, Addr line_addr, uns8 proc_id, uns8 cache_cycle);
+static inline Dcache_Data* dcache_victim_cache_access(Op* op, Addr line_addr);
+static inline Flag dcache_victim_cache_insert_line(Addr line_addr, Dcache_Data* line);
 
 static inline Dcache_Data* dcache_fill_get_cacheline(Mem_Req* req);
 static inline void dcache_fill_process_cacheline(Mem_Req* req, Dcache_Data* data);
@@ -110,6 +112,10 @@ void init_dcache_stage(uns8 proc_id, const char* name) {
 
   /* initialize the cache structure */
   init_cache(&dc->dcache, "DCACHE", DCACHE_SIZE, DCACHE_ASSOC, DCACHE_LINE_SIZE, sizeof(Dcache_Data), DCACHE_REPL);
+  if (VICTIM_CACHE_ON && VICTIM_CACHE_ENTRIES > 0) {
+    init_cache(&dc->victim_cache, "VICTIM_CACHE", VICTIM_CACHE_ENTRIES * DCACHE_LINE_SIZE, VICTIM_CACHE_ENTRIES,
+               DCACHE_LINE_SIZE, sizeof(Dcache_Data), REPL_TRUE_LRU);
+  }
   dcache_3c_init(proc_id, DCACHE_SIZE, DCACHE_LINE_SIZE);
   reset_dcache_stage();
 
@@ -266,6 +272,10 @@ void update_dcache_stage(Stage_Data* src_sd) {
       STAT_EVENT(op->proc_id, POWER_DCACHE_WRITE_ACCESS);
     else
       STAT_EVENT(op->proc_id, POWER_DCACHE_READ_ACCESS);
+
+    if (VICTIM_CACHE_ON && VICTIM_CACHE_ENTRIES > 0 && !line) {
+      line = dcache_victim_cache_access(op, line_addr);
+    }
 
     // if the data hits dc_pref_cache then insert to the dcache immediately
     if (DC_PREF_CACHE_ENABLE && !line) {
@@ -577,6 +587,72 @@ static inline Flag dcache_miss_new_mem_req(Op* op, Addr line_addr, Mem_Req_Type 
                      DCACHE_CYCLES - 1 + op->inst_info->extra_ld_latency, op, dcache_fill_line, op->unique_num, 0);
 }
 
+static inline Flag dcache_victim_cache_insert_line(Addr line_addr, Dcache_Data* line) {
+  if (!VICTIM_CACHE_ON || VICTIM_CACHE_ENTRIES == 0 || line == NULL)
+    return TRUE;
+
+  Addr victim_repl_line_addr;
+  Flag victim_repl_valid;
+  Dcache_Data* victim_repl_line =
+    (Dcache_Data*)get_next_repl_line(&dc->victim_cache, dc->proc_id, line_addr, &victim_repl_line_addr,
+                                     &victim_repl_valid);
+
+  if (victim_repl_valid && victim_repl_line->dirty) {
+    uns repl_proc_id = get_proc_id_from_cmp_addr(victim_repl_line_addr);
+    if (!new_mem_dc_wb_req(MRT_WB, repl_proc_id, victim_repl_line_addr, DCACHE_LINE_SIZE, 1, NULL, NULL, unique_count,
+                           TRUE)) {
+      return FALSE;
+    }
+    STAT_EVENT(dc->proc_id, VICTIM_CACHE_DIRTY_WB);
+    STAT_EVENT(dc->proc_id, DCACHE_WB_REQ_DIRTY);
+    STAT_EVENT(dc->proc_id, DCACHE_WB_REQ);
+  }
+
+  Addr inserted_line_addr;
+  Addr replaced_line_addr;
+  Dcache_Data* inserted_line =
+    (Dcache_Data*)cache_insert(&dc->victim_cache, dc->proc_id, line_addr, &inserted_line_addr, &replaced_line_addr);
+  *inserted_line = *line;
+  STAT_EVENT(dc->proc_id, VICTIM_CACHE_INSERT);
+  return TRUE;
+}
+
+static inline Dcache_Data* dcache_victim_cache_access(Op* op, Addr line_addr) {
+  Addr victim_line_addr;
+  Dcache_Data* victim_line = (Dcache_Data*)cache_access(&dc->victim_cache, line_addr, &victim_line_addr, TRUE);
+  if (!victim_line) {
+    STAT_EVENT(op->proc_id, VICTIM_CACHE_MISS);
+    return NULL;
+  }
+
+  Dcache_Data victim_copy = *victim_line;
+  Addr ignored_line_addr;
+  cache_invalidate(&dc->victim_cache, victim_line_addr, &ignored_line_addr);
+
+  Addr dcache_repl_line_addr;
+  Flag dcache_repl_valid;
+  Dcache_Data* dcache_repl_line =
+    (Dcache_Data*)get_next_repl_line(&dc->dcache, dc->proc_id, line_addr, &dcache_repl_line_addr, &dcache_repl_valid);
+  Dcache_Data dcache_repl_copy;
+  if (dcache_repl_valid)
+    dcache_repl_copy = *dcache_repl_line;
+
+  Addr inserted_line_addr;
+  Addr replaced_line_addr;
+  Dcache_Data* dcache_line =
+    (Dcache_Data*)cache_insert(&dc->dcache, dc->proc_id, line_addr, &inserted_line_addr, &replaced_line_addr);
+  *dcache_line = victim_copy;
+
+  if (dcache_repl_valid) {
+    Flag inserted = dcache_victim_cache_insert_line(dcache_repl_line_addr, &dcache_repl_copy);
+    ASSERT(op->proc_id, inserted);
+  }
+
+  STAT_EVENT(op->proc_id, VICTIM_CACHE_HIT);
+  STAT_EVENT(op->proc_id, VICTIM_CACHE_SWAP);
+  return dcache_line;
+}
+
 static inline void dcache_cacheline_hit(Op* op, Addr line_addr, Dcache_Data* line) {
   /* prefetching handle */
   if (PREF_FRAMEWORK_ON && (PREF_UPDATE_ON_WRONGPATH || !op->off_path)) {
@@ -799,7 +875,11 @@ static inline Dcache_Data* dcache_fill_get_cacheline(Mem_Req* req) {
    */
   Flag repl_line_valid;
   data = (Dcache_Data*)get_next_repl_line(&dc->dcache, dc->proc_id, req->addr, &repl_line_addr, &repl_line_valid);
-  if (repl_line_valid && data->dirty) {
+  if (repl_line_valid && VICTIM_CACHE_ON && VICTIM_CACHE_ENTRIES > 0) {
+    if (!dcache_victim_cache_insert_line(repl_line_addr, data)) {
+      return NULL;
+    }
+  } else if (repl_line_valid && data->dirty) {
     /* need to do a write-back */
     uns repl_proc_id = get_proc_id_from_cmp_addr(repl_line_addr);
     DEBUG(dc->proc_id, "Scheduling writeback of addr:0x%s\n", hexstr64s(repl_line_addr));
