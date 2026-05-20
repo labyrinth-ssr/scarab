@@ -79,6 +79,7 @@ DEF_PARAM( pref_update_on_wrongpath            , PREF_UPDATE_ON_WRONGPATH       
 
 DEF_PARAM( pref_train_on_pref_misses           , PREF_TRAIN_ON_PREF_MISSES           , Flag            , Flag               , FALSE     ,    )
 DEF_PARAM( pref_oracle_train_on                , PREF_ORACLE_TRAIN_ON                , Flag            , Flag               , FALSE     ,    )
+DEF_PARAM( pref_oracle_train                   , PREF_ORACLE_TRAIN                   , Flag            , Flag               , FALSE     ,    )
 
      // Throttling Stuff
 // Prefetcher drops a request when memory req buffer is full
